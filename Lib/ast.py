@@ -59,14 +59,15 @@ def literal_eval(node_or_string):
     sets, booleans, and None.
     """
     if isinstance(node_or_string, str):
-        node_or_string = parse(node_or_string, mode='eval')
+        node_or_string = parse(node_or_string.lstrip(" \t"), mode='eval')
     if isinstance(node_or_string, Expression):
         node_or_string = node_or_string.body
+    def _raise_malformed_node(node):
+        raise ValueError(f'malformed node or string: {node!r}')
     def _convert_num(node):
-        if isinstance(node, Constant):
-            if type(node.value) in (int, float, complex):
-                return node.value
-        raise ValueError('malformed node or string: ' + repr(node))
+        if not isinstance(node, Constant) or type(node.value) not in (int, float, complex):
+            _raise_malformed_node(node)
+        return node.value
     def _convert_signed_num(node):
         if isinstance(node, UnaryOp) and isinstance(node.op, (UAdd, USub)):
             operand = _convert_num(node.operand)
@@ -88,6 +89,8 @@ def literal_eval(node_or_string):
               node.func.id == 'set' and node.args == node.keywords == []):
             return set()
         elif isinstance(node, Dict):
+            if len(node.keys) != len(node.values):
+                _raise_malformed_node(node)
             return dict(zip(map(_convert, node.keys),
                             map(_convert, node.values)))
         elif isinstance(node, BinOp) and isinstance(node.op, (Add, Sub)):
@@ -123,31 +126,36 @@ def dump(node, annotate_fields=True, include_attributes=False, *, indent=None):
             prefix = ''
             sep = ', '
         if isinstance(node, AST):
+            cls = type(node)
             args = []
             allsimple = True
             keywords = annotate_fields
-            for field in node._fields:
+            for name in node._fields:
                 try:
-                    value = getattr(node, field)
+                    value = getattr(node, name)
                 except AttributeError:
                     keywords = True
+                    continue
+                if value is None and getattr(cls, name, ...) is None:
+                    keywords = True
+                    continue
+                value, simple = _format(value, level)
+                allsimple = allsimple and simple
+                if keywords:
+                    args.append('%s=%s' % (name, value))
                 else:
+                    args.append(value)
+            if include_attributes and node._attributes:
+                for name in node._attributes:
+                    try:
+                        value = getattr(node, name)
+                    except AttributeError:
+                        continue
+                    if value is None and getattr(cls, name, ...) is None:
+                        continue
                     value, simple = _format(value, level)
                     allsimple = allsimple and simple
-                    if keywords:
-                        args.append('%s=%s' % (field, value))
-                    else:
-                        args.append(value)
-            if include_attributes and node._attributes:
-                for attr in node._attributes:
-                    try:
-                        value = getattr(node, attr)
-                    except AttributeError:
-                        pass
-                    else:
-                        value, simple = _format(value, level)
-                        allsimple = allsimple and simple
-                        args.append('%s=%s' % (attr, value))
+                    args.append('%s=%s' % (name, value))
             if allsimple and len(args) <= 3:
                 return '%s(%s)' % (node.__class__.__name__, ', '.join(args)), not args
             return '%s(%s%s)' % (node.__class__.__name__, prefix, sep.join(args)), False
@@ -170,9 +178,14 @@ def copy_location(new_node, old_node):
     attributes) from *old_node* to *new_node* if possible, and return *new_node*.
     """
     for attr in 'lineno', 'col_offset', 'end_lineno', 'end_col_offset':
-        if attr in old_node._attributes and attr in new_node._attributes \
-           and hasattr(old_node, attr):
-            setattr(new_node, attr, getattr(old_node, attr))
+        if attr in old_node._attributes and attr in new_node._attributes:
+            value = getattr(old_node, attr, None)
+            # end_lineno and end_col_offset are optional attributes, and they
+            # should be copied whether the value is None or not.
+            if value is not None or (
+                hasattr(old_node, attr) and attr.startswith("end_")
+            ):
+                setattr(new_node, attr, value)
     return new_node
 
 
@@ -191,7 +204,7 @@ def fix_missing_locations(node):
             else:
                 lineno = node.lineno
         if 'end_lineno' in node._attributes:
-            if not hasattr(node, 'end_lineno'):
+            if getattr(node, 'end_lineno', None) is None:
                 node.end_lineno = end_lineno
             else:
                 end_lineno = node.end_lineno
@@ -201,7 +214,7 @@ def fix_missing_locations(node):
             else:
                 col_offset = node.col_offset
         if 'end_col_offset' in node._attributes:
-            if not hasattr(node, 'end_col_offset'):
+            if getattr(node, 'end_col_offset', None) is None:
                 node.end_col_offset = end_col_offset
             else:
                 end_col_offset = node.end_col_offset
@@ -220,8 +233,11 @@ def increment_lineno(node, n=1):
     for child in walk(node):
         if 'lineno' in child._attributes:
             child.lineno = getattr(child, 'lineno', 0) + n
-        if 'end_lineno' in child._attributes:
-            child.end_lineno = getattr(child, 'end_lineno', 0) + n
+        if (
+            "end_lineno" in child._attributes
+            and (end_lineno := getattr(child, "end_lineno", 0)) is not None
+        ):
+            child.end_lineno = end_lineno + n
     return node
 
 
@@ -323,6 +339,8 @@ def get_source_segment(source, node, *, padded=False):
     be padded with spaces to match its original position.
     """
     try:
+        if node.end_lineno is None or node.end_col_offset is None:
+            return None
         lineno = node.lineno - 1
         end_lineno = node.end_lineno - 1
         col_offset = node.col_offset
@@ -437,11 +455,11 @@ class NodeTransformer(NodeVisitor):
        class RewriteName(NodeTransformer):
 
            def visit_Name(self, node):
-               return copy_location(Subscript(
+               return Subscript(
                    value=Name(id='data', ctx=Load()),
-                   slice=Index(value=Str(s=node.id)),
+                   slice=Constant(value=node.id),
                    ctx=node.ctx
-               ), node)
+               )
 
     Keep in mind that if the node you're operating on has child nodes you must
     either transform the child nodes yourself or call the :meth:`generic_visit`
@@ -479,19 +497,25 @@ class NodeTransformer(NodeVisitor):
         return node
 
 
-# The following code is for backward compatibility.
-# It will be removed in future.
+# If the ast module is loaded more than once, only add deprecated methods once
+if not hasattr(Constant, 'n'):
+    # The following code is for backward compatibility.
+    # It will be removed in future.
 
-def _getter(self):
-    return self.value
+    def _getter(self):
+        """Deprecated. Use value instead."""
+        return self.value
 
-def _setter(self, value):
-    self.value = value
+    def _setter(self, value):
+        self.value = value
 
-Constant.n = property(_getter, _setter)
-Constant.s = property(_getter, _setter)
+    Constant.n = property(_getter, _setter)
+    Constant.s = property(_getter, _setter)
 
 class _ABC(type):
+
+    def __init__(cls, *args):
+        cls.__doc__ = """Deprecated AST node class. Use ast.Constant instead"""
 
     def __instancecheck__(cls, inst):
         if not isinstance(inst, Constant):
@@ -509,6 +533,13 @@ class _ABC(type):
         return type.__instancecheck__(cls, inst)
 
 def _new(cls, *args, **kwargs):
+    for key in kwargs:
+        if key not in cls._fields:
+            # arbitrary keyword arguments are accepted
+            continue
+        pos = cls._fields.index(key)
+        if pos < len(args):
+            raise TypeError(f"{cls.__name__} got multiple values for argument {key!r}")
     if cls in _const_types:
         return Constant(*args, **kwargs)
     return Constant.__new__(cls, *args, **kwargs)
@@ -546,6 +577,7 @@ _const_types = {
 _const_types_not = {
     Num: (bool,),
 }
+
 _const_node_type_names = {
     bool: 'NameConstant',  # should be before int
     type(None): 'NameConstant',
@@ -556,6 +588,46 @@ _const_node_type_names = {
     bytes: 'Bytes',
     type(...): 'Ellipsis',
 }
+
+class slice(AST):
+    """Deprecated AST node class."""
+
+class Index(slice):
+    """Deprecated AST node class. Use the index value directly instead."""
+    def __new__(cls, value, **kwargs):
+        return value
+
+class ExtSlice(slice):
+    """Deprecated AST node class. Use ast.Tuple instead."""
+    def __new__(cls, dims=(), **kwargs):
+        return Tuple(list(dims), Load(), **kwargs)
+
+# If the ast module is loaded more than once, only add deprecated methods once
+if not hasattr(Tuple, 'dims'):
+    # The following code is for backward compatibility.
+    # It will be removed in future.
+
+    def _dims_getter(self):
+        """Deprecated. Use elts instead."""
+        return self.elts
+
+    def _dims_setter(self, value):
+        self.elts = value
+
+    Tuple.dims = property(_dims_getter, _dims_setter)
+
+class Suite(mod):
+    """Deprecated AST node class.  Unused in Python 3."""
+
+class AugLoad(expr_context):
+    """Deprecated AST node class.  Unused in Python 3."""
+
+class AugStore(expr_context):
+    """Deprecated AST node class.  Unused in Python 3."""
+
+class Param(expr_context):
+    """Deprecated AST node class.  Unused in Python 3."""
+
 
 # Large float and imaginary literals get turned into infinities in the AST.
 # We unparse those infinities to INFSTR.
@@ -599,6 +671,7 @@ class _Unparser(NodeVisitor):
         self._source = []
         self._buffer = []
         self._precedences = {}
+        self._type_ignores = {}
         self._indent = 0
 
     def interleave(self, inter, f, seq):
@@ -613,10 +686,26 @@ class _Unparser(NodeVisitor):
                 inter()
                 f(x)
 
+    def items_view(self, traverser, items):
+        """Traverse and separate the given *items* with a comma and append it to
+        the buffer. If *items* is a single item sequence, a trailing comma
+        will be added."""
+        if len(items) == 1:
+            traverser(items[0])
+            self.write(",")
+        else:
+            self.interleave(lambda: self.write(", "), traverser, items)
+
+    def maybe_newline(self):
+        """Adds a newline if it isn't the start of generated source"""
+        if self._source:
+            self.write("\n")
+
     def fill(self, text=""):
         """Indent a piece of text and append it, according to the current
         indentation level"""
-        self.write("\n" + "    " * self._indent + text)
+        self.maybe_newline()
+        self.write("    " * self._indent + text)
 
     def write(self, text):
         """Append a piece of text"""
@@ -632,11 +721,15 @@ class _Unparser(NodeVisitor):
         return value
 
     @contextmanager
-    def block(self):
+    def block(self, *, extra = None):
         """A context manager for preparing the source for blocks. It adds
         the character':', increases the indentation on enter and decreases
-        the indentation on exit."""
+        the indentation on exit. If *extra* is given, it will be directly
+        appended after the colon character.
+        """
         self.write(":")
+        if extra:
+            self.write(extra)
         self._indent += 1
         yield
         self._indent -= 1
@@ -667,6 +760,27 @@ class _Unparser(NodeVisitor):
         for node in nodes:
             self._precedences[node] = precedence
 
+    def get_raw_docstring(self, node):
+        """If a docstring node is found in the body of the *node* parameter,
+        return that docstring node, None otherwise.
+
+        Logic mirrored from ``_PyAST_GetDocString``."""
+        if not isinstance(
+            node, (AsyncFunctionDef, FunctionDef, ClassDef, Module)
+        ) or len(node.body) < 1:
+            return None
+        node = node.body[0]
+        if not isinstance(node, Expr):
+            return None
+        node = node.value
+        if isinstance(node, Constant) and isinstance(node.value, str):
+            return node
+
+    def get_type_comment(self, node):
+        comment = self._type_ignores.get(node.lineno) or node.type_comment
+        if comment is not None:
+            return f" # type: {comment}"
+
     def traverse(self, node):
         if isinstance(node, list):
             for item in node:
@@ -681,9 +795,29 @@ class _Unparser(NodeVisitor):
         self.traverse(node)
         return "".join(self._source)
 
+    def _write_docstring_and_traverse_body(self, node):
+        if (docstring := self.get_raw_docstring(node)):
+            self._write_docstring(docstring)
+            self.traverse(node.body[1:])
+        else:
+            self.traverse(node.body)
+
     def visit_Module(self, node):
-        for subnode in node.body:
-            self.traverse(subnode)
+        self._type_ignores = {
+            ignore.lineno: f"ignore{ignore.tag}"
+            for ignore in node.type_ignores
+        }
+        self._write_docstring_and_traverse_body(node)
+        self._type_ignores.clear()
+
+    def visit_FunctionType(self, node):
+        with self.delimit("(", ")"):
+            self.interleave(
+                lambda: self.write(", "), self.traverse, node.argtypes
+            )
+
+        self.write(" -> ")
+        self.traverse(node.returns)
 
     def visit_Expr(self, node):
         self.fill()
@@ -715,6 +849,8 @@ class _Unparser(NodeVisitor):
             self.traverse(target)
             self.write(" = ")
         self.traverse(node.value)
+        if type_comment := self.get_type_comment(node):
+            self.write(type_comment)
 
     def visit_AugAssign(self, node):
         self.fill()
@@ -829,12 +965,12 @@ class _Unparser(NodeVisitor):
             self.traverse(node.body)
 
     def visit_ClassDef(self, node):
-        self.write("\n")
+        self.maybe_newline()
         for deco in node.decorator_list:
             self.fill("@")
             self.traverse(deco)
         self.fill("class " + node.name)
-        with self.delimit("(", ")"):
+        with self.delimit_if("(", ")", condition = node.bases or node.keywords):
             comma = False
             for e in node.bases:
                 if comma:
@@ -850,16 +986,16 @@ class _Unparser(NodeVisitor):
                 self.traverse(e)
 
         with self.block():
-            self.traverse(node.body)
+            self._write_docstring_and_traverse_body(node)
 
     def visit_FunctionDef(self, node):
-        self.__FunctionDef_helper(node, "def")
+        self._function_helper(node, "def")
 
     def visit_AsyncFunctionDef(self, node):
-        self.__FunctionDef_helper(node, "async def")
+        self._function_helper(node, "async def")
 
-    def __FunctionDef_helper(self, node, fill_suffix):
-        self.write("\n")
+    def _function_helper(self, node, fill_suffix):
+        self.maybe_newline()
         for deco in node.decorator_list:
             self.fill("@")
             self.traverse(deco)
@@ -870,21 +1006,21 @@ class _Unparser(NodeVisitor):
         if node.returns:
             self.write(" -> ")
             self.traverse(node.returns)
-        with self.block():
-            self.traverse(node.body)
+        with self.block(extra=self.get_type_comment(node)):
+            self._write_docstring_and_traverse_body(node)
 
     def visit_For(self, node):
-        self.__For_helper("for ", node)
+        self._for_helper("for ", node)
 
     def visit_AsyncFor(self, node):
-        self.__For_helper("async for ", node)
+        self._for_helper("async for ", node)
 
-    def __For_helper(self, fill, node):
+    def _for_helper(self, fill, node):
         self.fill(fill)
         self.traverse(node.target)
         self.write(" in ")
         self.traverse(node.iter)
-        with self.block():
+        with self.block(extra=self.get_type_comment(node)):
             self.traverse(node.body)
         if node.orelse:
             self.fill("else")
@@ -922,13 +1058,13 @@ class _Unparser(NodeVisitor):
     def visit_With(self, node):
         self.fill("with ")
         self.interleave(lambda: self.write(", "), self.traverse, node.items)
-        with self.block():
+        with self.block(extra=self.get_type_comment(node)):
             self.traverse(node.body)
 
     def visit_AsyncWith(self, node):
         self.fill("async with ")
         self.interleave(lambda: self.write(", "), self.traverse, node.items)
-        with self.block():
+        with self.block(extra=self.get_type_comment(node)):
             self.traverse(node.body)
 
     def visit_JoinedStr(self, node):
@@ -956,7 +1092,7 @@ class _Unparser(NodeVisitor):
         write("{")
         unparser = type(self)()
         unparser.set_precedence(_Precedence.TEST.next(), node.value)
-        expr = unparser.visit(node.value).rstrip("\n")
+        expr = unparser.visit(node.value)
         if expr.startswith("{"):
             write(" ")  # Separate pair of opening brackets as "{ {"
         write(expr)
@@ -974,6 +1110,30 @@ class _Unparser(NodeVisitor):
     def visit_Name(self, node):
         self.write(node.id)
 
+    def _write_docstring(self, node):
+        def esc_char(c):
+            if c in ("\n", "\t"):
+                # In the AST form, we don't know the author's intentation
+                # about how this should be displayed. We'll only escape
+                # \n and \t, because they are more likely to be unescaped
+                # in the source
+                return c
+            return c.encode('unicode_escape').decode('ascii')
+
+        self.fill()
+        if node.kind == "u":
+            self.write("u")
+
+        value = node.value
+        if value:
+            # Preserve quotes in the docstring by escaping them
+            value = "".join(map(esc_char, value))
+            if value[-1] == '"':
+                value = value.replace('"', '\\"', -1)
+            value = value.replace('"""', '""\\"')
+
+        self.write(f'"""{value}"""')
+
     def _write_constant(self, value):
         if isinstance(value, (float, complex)):
             # Substitute overflowing decimal literal for AST infinities.
@@ -985,11 +1145,7 @@ class _Unparser(NodeVisitor):
         value = node.value
         if isinstance(value, tuple):
             with self.delimit("(", ")"):
-                if len(value) == 1:
-                    self._write_constant(value[0])
-                    self.write(",")
-                else:
-                    self.interleave(lambda: self.write(", "), self._write_constant, value)
+                self.items_view(self._write_constant, value)
         elif value is ...:
             self.write("...")
         else:
@@ -1053,7 +1209,7 @@ class _Unparser(NodeVisitor):
 
     def visit_Set(self, node):
         if not node.elts:
-            raise ValueError("Set node should has at least one item")
+            raise ValueError("Set node should have at least one item")
         with self.delimit("{", "}"):
             self.interleave(lambda: self.write(", "), self.traverse, node.elts)
 
@@ -1081,19 +1237,14 @@ class _Unparser(NodeVisitor):
 
     def visit_Tuple(self, node):
         with self.delimit("(", ")"):
-            if len(node.elts) == 1:
-                elt = node.elts[0]
-                self.traverse(elt)
-                self.write(",")
-            else:
-                self.interleave(lambda: self.write(", "), self.traverse, node.elts)
+            self.items_view(self.traverse, node.elts)
 
     unop = {"Invert": "~", "Not": "not", "UAdd": "+", "USub": "-"}
     unop_precedence = {
-        "~": _Precedence.FACTOR,
         "not": _Precedence.NOT,
+        "~": _Precedence.FACTOR,
         "+": _Precedence.FACTOR,
-        "-": _Precedence.FACTOR
+        "-": _Precedence.FACTOR,
     }
 
     def visit_UnaryOp(self, node):
@@ -1101,7 +1252,10 @@ class _Unparser(NodeVisitor):
         operator_precedence = self.unop_precedence[operator]
         with self.require_parens(operator_precedence, node):
             self.write(operator)
-            self.write(" ")
+            # factor prefixes (+, -, ~) shouldn't be seperated
+            # from the value they belong, (e.g: +1 instead of + 1)
+            if operator_precedence is not _Precedence.FACTOR:
+                self.write(" ")
             self.set_precedence(operator_precedence, node.operand)
             self.traverse(node.operand)
 
@@ -1223,10 +1377,23 @@ class _Unparser(NodeVisitor):
                 self.traverse(e)
 
     def visit_Subscript(self, node):
+        def is_simple_tuple(slice_value):
+            # when unparsing a non-empty tuple, the parantheses can be safely
+            # omitted if there aren't any elements that explicitly requires
+            # parantheses (such as starred expressions).
+            return (
+                isinstance(slice_value, Tuple)
+                and slice_value.elts
+                and not any(isinstance(elt, Starred) for elt in slice_value.elts)
+            )
+
         self.set_precedence(_Precedence.ATOM, node.value)
         self.traverse(node.value)
         with self.delimit("[", "]"):
-            self.traverse(node.slice)
+            if is_simple_tuple(node.slice):
+                self.items_view(self.traverse, node.slice.elts)
+            else:
+                self.traverse(node.slice)
 
     def visit_Starred(self, node):
         self.write("*")
@@ -1235,10 +1402,6 @@ class _Unparser(NodeVisitor):
 
     def visit_Ellipsis(self, node):
         self.write("...")
-
-    def visit_Index(self, node):
-        self.set_precedence(_Precedence.TUPLE, node.value)
-        self.traverse(node.value)
 
     def visit_Slice(self, node):
         if node.lower:
@@ -1249,9 +1412,6 @@ class _Unparser(NodeVisitor):
         if node.step:
             self.write(":")
             self.traverse(node.step)
-
-    def visit_ExtSlice(self, node):
-        self.interleave(lambda: self.write(", "), self.traverse, node.dims)
 
     def visit_arg(self, node):
         self.write(node.arg)

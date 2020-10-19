@@ -103,6 +103,13 @@ If you instantiate any of these types, note that signatures may vary between Pyt
 
 Standard names are defined for the following types:
 
+.. data:: NoneType
+
+   The type of :data:`None`.
+
+   .. versionadded:: 3.10
+
+
 .. data:: FunctionType
           LambdaType
 
@@ -186,6 +193,13 @@ Standard names are defined for the following types:
    .. versionadded:: 3.7
 
 
+.. data:: NotImplementedType
+
+   The type of :data:`NotImplemented`.
+
+   .. versionadded:: 3.10
+
+
 .. data:: MethodDescriptorType
 
    The type of methods of some built-in data types such as :meth:`str.join`.
@@ -236,6 +250,18 @@ Standard names are defined for the following types:
          Defaults to ``None``. Previously the attribute was optional.
 
 
+.. data:: EllipsisType
+
+   The type of :data:`Ellipsis`.
+
+   .. versionadded:: 3.10
+
+.. data:: Union
+
+   The type of :ref:`union type expressions<types-union>`.
+
+   .. versionadded:: 3.10
+
 .. class:: TracebackType(tb_next, tb_frame, tb_lasti, tb_lineno)
 
    The type of traceback objects such as found in ``sys.exc_info()[2]``.
@@ -282,6 +308,11 @@ Standard names are defined for the following types:
 
    .. versionadded:: 3.3
 
+   .. versionchanged:: 3.9
+
+      Updated to support the new union (``|``) operator from :pep:`584`, which
+      simply delegates to the underlying mapping.
+
    .. describe:: key in proxy
 
       Return ``True`` if the underlying mapping has a key *key*, else
@@ -324,6 +355,12 @@ Standard names are defined for the following types:
 
       Return a new view of the underlying mapping's values.
 
+   .. describe:: reversed(proxy)
+
+      Return a reverse iterator over the keys of the underlying mapping.
+
+      .. versionadded:: 3.9
+
 
 Additional Utility Classes and Functions
 ----------------------------------------
@@ -344,8 +381,7 @@ Additional Utility Classes and Functions
                self.__dict__.update(kwargs)
 
            def __repr__(self):
-               keys = sorted(self.__dict__)
-               items = ("{}={!r}".format(k, self.__dict__[k]) for k in keys)
+               items = (f"{k}={v!r}" for k, v in self.__dict__.items())
                return "{}({})".format(type(self).__name__, ", ".join(items))
 
            def __eq__(self, other):
@@ -357,6 +393,9 @@ Additional Utility Classes and Functions
 
    .. versionadded:: 3.3
 
+   .. versionchanged:: 3.9
+      Attribute order in the repr changed from alphabetical to insertion (like
+      ``dict``).
 
 .. function:: DynamicClassAttribute(fget=None, fset=None, fdel=None, doc=None)
 
@@ -368,7 +407,7 @@ Additional Utility Classes and Functions
    class's __getattr__ method; this is done by raising AttributeError.
 
    This allows one to have properties active on an instance, and have virtual
-   attributes on the class with the same name (see Enum for an example).
+   attributes on the class with the same name (see :class:`enum.Enum` for an example).
 
    .. versionadded:: 3.4
 
